@@ -1,0 +1,8 @@
+# Simulator (git subtree in sim/), installed editable so edits apply without reinstalling
+-e ./sim
+
+# Legacy gym==0.9.4 needs pkg_resources, which newer setuptools removed
+setuptools<81
+
+# Dev / test
+pytest>=7.4
