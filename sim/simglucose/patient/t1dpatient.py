@@ -1,6 +1,7 @@
 from .base import Patient
 import numpy as np
 from scipy.integrate import ode
+from scipy.linalg import expm
 import pandas as pd
 from collections import namedtuple
 import logging
@@ -8,19 +9,43 @@ import pkg_resources
 
 logger = logging.getLogger(__name__)
 
-Action = namedtuple("patient_action", ["CHO", "insulin"])
+# glucagon is in ug/min (subcutaneous infusion rate); defaults to 0 so
+# insulin-only code keeps working unchanged
+Action = namedtuple("patient_action", ["CHO", "insulin", "glucagon"], defaults=(0.0,))
 Observation = namedtuple("observation", ["Gsub"])
 
 PATIENT_PARA_FILE = pkg_resources.resource_filename(
     "simglucose", "params/vpatient_params.csv"
 )
+GLUCAGON_PARA_FILE = pkg_resources.resource_filename(
+    "simglucose", "params/glucagon_params.csv"
+)
+N_BASE_STATES = 13  # original UVA/Padova states (solved by the ODE solver)
+N_STATES = 16  # + 3 glucagon states (x13, x14, x15), solved exactly, see below
+
+
+def load_glucagon_params(name=None):
+    """Glucagon parameters for a patient; falls back to the 'default' row."""
+    table = pd.read_csv(GLUCAGON_PARA_FILE)
+    row = table.loc[table.Name == name]
+    if row.empty:
+        row = table.loc[table.Name == "default"]
+    return row.squeeze()
 
 
 class T1DPatient(Patient):
     SAMPLE_TIME = 1  # min
     EAT_RATE = 5  # g/min CHO
 
-    def __init__(self, params, init_state=None, random_init_bg=False, seed=None, t0=0):
+    def __init__(
+        self,
+        params,
+        init_state=None,
+        random_init_bg=False,
+        seed=None,
+        t0=0,
+        glucagon_params=None,
+    ):
         """
         T1DPatient constructor.
         Inputs:
@@ -29,8 +54,13 @@ class T1DPatient(Patient):
               If not specified, load the default initial state in
               params.iloc[2:15]
             - t0: simulation start time, it is 0 by default
+            - glucagon_params: pandas sequence from glucagon_params.csv. If
+              not given, the 'default' row (or this patient's row) is used.
         """
         self._params = params
+        if glucagon_params is None:
+            glucagon_params = load_glucagon_params(params.Name)
+        self._gparams = glucagon_params
         self._init_state = init_state
         self.random_init_bg = random_init_bg
         self._seed = seed
@@ -65,7 +95,8 @@ class T1DPatient(Patient):
 
     @property
     def state(self):
-        return self._odesolver.y
+        """13 UVA/Padova states followed by 3 glucagon states."""
+        return np.concatenate([self._odesolver.y, self._gstate])
 
     @property
     def t(self):
@@ -101,9 +132,24 @@ class T1DPatient(Patient):
         # Update last input
         self._last_action = action
 
+        # Glucagon states depend only on the glucagon input (never on glucose),
+        # so they are advanced exactly, separately from the glucose ODE. This
+        # keeps the original 13-state ODE and its solver behaviour untouched.
+        g_start = self._gstate[2]
+        self._gstate = self._Ad @ self._gstate + self._Bd * (
+            action.glucagon / self._params.BW  # ug/min -> ug/kg/min
+        )
+        # glucagon action on the liver, averaged over the step
+        glu_effect = 0.5 * (g_start + self._gstate[2])
+
         # ODE solver
         self._odesolver.set_f_params(
-            action, self._params, self._last_Qsto, self._last_foodtaken
+            action,
+            self._params,
+            self._last_Qsto,
+            self._last_foodtaken,
+            self._gparams,
+            glu_effect,
         )
         if self._odesolver.successful():
             self._odesolver.integrate(self._odesolver.t + self.sample_time)
@@ -112,8 +158,8 @@ class T1DPatient(Patient):
             raise
 
     @staticmethod
-    def model(t, x, action, params, last_Qsto, last_foodtaken):
-        dxdt = np.zeros(13)
+    def model(t, x, action, params, last_Qsto, last_foodtaken, gparams=None, glu_effect=0.0):
+        dxdt = np.zeros(len(x))
         d = action.CHO * 1000  # g -> mg
         insulin = action.insulin * 6000 / params.BW  # U/min -> pmol/kg/min
         basal = params.u2ss * params.BW / 6000  # U/min
@@ -149,6 +195,10 @@ class T1DPatient(Patient):
         Rat = params.f * params.kabs * x[2] / params.BW
         # Glucose Production
         EGPt = params.kp1 - params.kp2 * x[3] - params.kp3 * x[8]
+        # Glucagon raises production. glu_effect is the (delayed) plasma
+        # glucagon above basal, so with no glucagon given this term is 0.
+        if gparams is not None:
+            EGPt = EGPt + gparams.kgn * glu_effect
         # Glucose Utilization
         Uiit = params.Fsnc
 
@@ -219,6 +269,30 @@ class T1DPatient(Patient):
         observation = Observation(Gsub=Gsub)
         return observation
 
+    def _glucagon_discrete_system(self):
+        """Exact one-step (SAMPLE_TIME) update of the linear glucagon chain.
+
+        States: g[0] subcutaneous depot (ug/kg), g[1] plasma glucagon above
+        basal (ug/kg), g[2] delayed action on the liver (ug/L). Input is the
+        infusion rate in ug/kg/min, held constant over the step.
+            dg0 = u - kgl_abs*g0
+            dg1 = kgl_abs*g0 - kgl_cl*g1
+            dg2 = -kgl_eff*(g2 - g1/Vgl)
+        This follows the same depot -> plasma -> delayed-action chain as insulin.
+        """
+        gp = self._gparams
+        A = np.array(
+            [
+                [-gp.kgl_abs, 0.0, 0.0],
+                [gp.kgl_abs, -gp.kgl_cl, 0.0],
+                [0.0, gp.kgl_eff / gp.Vgl, -gp.kgl_eff],
+            ]
+        )
+        B = np.array([1.0, 0.0, 0.0])
+        Ad = expm(A * self.SAMPLE_TIME)
+        Bd = np.linalg.solve(A, (Ad - np.eye(3)) @ B)
+        return Ad, Bd
+
     def _announce_meal(self, meal):
         """
         patient announces meal.
@@ -251,7 +325,14 @@ class T1DPatient(Patient):
         if self._init_state is None:
             self.init_state = np.copy(self._params.iloc[2:15].values)
         else:
-            self.init_state = self._init_state
+            self.init_state = np.copy(self._init_state)
+        # glucagon states start at zero (no glucagon above basal)
+        if len(self.init_state) == N_STATES:
+            self._gstate = np.array(self.init_state[N_BASE_STATES:], dtype=float)
+            self.init_state = self.init_state[:N_BASE_STATES]
+        else:
+            self._gstate = np.zeros(N_STATES - N_BASE_STATES)
+        self._Ad, self._Bd = self._glucagon_discrete_system()
 
         self.random_state = np.random.RandomState(self.seed)
         if self.random_init_bg:
@@ -280,7 +361,7 @@ class T1DPatient(Patient):
         self._odesolver = ode(self.model).set_integrator("dopri5")
         self._odesolver.set_initial_value(self.init_state, self.t0)
 
-        self._last_action = Action(CHO=0, insulin=0)
+        self._last_action = Action(CHO=0, insulin=0, glucagon=0)
         self.is_eating = False
         self.planned_meal = 0
 
