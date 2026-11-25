@@ -1,6 +1,11 @@
+# Config, data and cache folders
 .venv/
 __pycache__/
 *.egg-info/
 .DS_Store
 results/
 data/
+.pytest_cache/
+
+
+# Specific files
