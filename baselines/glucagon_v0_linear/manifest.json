@@ -1,0 +1,52 @@
+{
+  "tag": "glucagon_v0_linear",
+  "created_utc": "2026-11-26T02:22:28+00:00",
+  "git_commit": "7f801af8f9fb5c4966100b4a9e38673894f9ec84",
+  "git_dirty": true,
+  "command": "report_graphs.py run --tag glucagon_v0_linear",
+  "seed": 1,
+  "quick": false,
+  "patients": [
+    "adolescent#001",
+    "adolescent#002",
+    "adult#001",
+    "adult#002",
+    "child#001",
+    "child#002"
+  ],
+  "doses_ug": [
+    0,
+    50,
+    100,
+    150,
+    200,
+    250,
+    300,
+    350,
+    400,
+    450,
+    500
+  ],
+  "bolus_mults": [
+    1.0,
+    2.0,
+    3.0
+  ],
+  "gate_dose_ug": 200,
+  "trigger_mg_dl": 70.0,
+  "target_nadir_mg_dl": 54.0,
+  "sample_min": 3,
+  "stress_hours": 24,
+  "skipped_patients": [],
+  "glucagon_params_default_row": {
+    "Name": "default",
+    "kgl_abs": 0.1,
+    "kgl_cl": 0.12,
+    "Vgl": 0.2,
+    "kgl_eff": 0.1,
+    "kgn": 1.1
+  },
+  "python": "3.10.14",
+  "numpy": "2.2.6",
+  "pandas": "2.3.3"
+}
