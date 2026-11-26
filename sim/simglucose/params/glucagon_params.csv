@@ -1,2 +1,2 @@
-Name,kgl_abs,kgl_cl,Vgl,kgl_eff,kgn
-default,0.1,0.12,0.2,0.1,1.1
+Name,kgl_abs,kgl_cl,Vgl,kgl_eff,kgn,model
+default,0.1,0.12,0.2,0.1,1.1,legacy_linear

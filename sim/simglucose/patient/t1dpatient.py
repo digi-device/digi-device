@@ -33,6 +33,38 @@ def load_glucagon_params(name=None):
     return row.squeeze()
 
 
+# Glucagon-action models, selected by the 'model' column of glucagon_params.csv.
+#   legacy_linear: glucagon effect is added to EGP in proportion to the delayed plasma
+#                  glucagon (kgn * g2). Kept unchanged so earlier results stay reproducible.
+GLUCAGON_MODELS = ("legacy_linear",)
+DEFAULT_GLUCAGON_MODEL = "legacy_linear"
+
+
+def glucagon_model_name(gparams):
+    """Which glucagon model a parameter row selects. A row with no 'model' value is legacy_linear."""
+    if gparams is None:
+        return DEFAULT_GLUCAGON_MODEL
+    name = getattr(gparams, "model", None)
+    if name is None or (isinstance(name, float) and np.isnan(name)):
+        return DEFAULT_GLUCAGON_MODEL
+    if name not in GLUCAGON_MODELS:
+        raise ValueError(f"unknown glucagon model '{name}'; choose one of {GLUCAGON_MODELS}")
+    return name
+
+
+def glucagon_egp(gparams, glu_effect):
+    """Glucagon's contribution to endogenous glucose production (mg/kg/min).
+
+    glu_effect is the delayed plasma-glucagon signal from the glucagon states. New models branch here.
+    """
+    if gparams is None:
+        return 0.0
+    model = glucagon_model_name(gparams)
+    if model == "legacy_linear":
+        return gparams.kgn * glu_effect
+    raise NotImplementedError(model)  # listed in GLUCAGON_MODELS but not implemented above
+
+
 class T1DPatient(Patient):
     SAMPLE_TIME = 1  # min
     EAT_RATE = 5  # g/min CHO
@@ -61,6 +93,7 @@ class T1DPatient(Patient):
         if glucagon_params is None:
             glucagon_params = load_glucagon_params(params.Name)
         self._gparams = glucagon_params
+        self._gmodel = glucagon_model_name(glucagon_params)  # fails early on an unknown model
         self._init_state = init_state
         self.random_init_bg = random_init_bg
         self._seed = seed
@@ -197,8 +230,8 @@ class T1DPatient(Patient):
         EGPt = params.kp1 - params.kp2 * x[3] - params.kp3 * x[8]
         # Glucagon raises production. glu_effect is the (delayed) plasma
         # glucagon above basal, so with no glucagon given this term is 0.
-        if gparams is not None:
-            EGPt = EGPt + gparams.kgn * glu_effect
+        # The model used is chosen by the 'model' column of glucagon_params.csv.
+        EGPt = EGPt + glucagon_egp(gparams, glu_effect)
         # Glucose Utilization
         Uiit = params.Fsnc
 

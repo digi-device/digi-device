@@ -1,11 +1,14 @@
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from simglucose.actuator.pump import InsulinPump, PumpConfig, PumpModel
 from simglucose.controller.basal_bolus_ctrller import BBController
-from simglucose.patient.t1dpatient import Action, T1DPatient
+from simglucose.patient import t1dpatient
+from simglucose.patient.t1dpatient import Action, T1DPatient, load_glucagon_params
 from simglucose.sensor.cgm import CGMSensor
 from simglucose.simulation.dual_env import DualAction, DualHormoneEnv
 from simglucose.simulation.env import T1DSimEnv
@@ -114,3 +117,61 @@ def test_dual_env_glucagon_raises_bg_and_logs_pump_state():
     e0, _ = _env(DualHormoneEnv, gl_pump=PumpModel())
     h0 = _run(e0, s, 6)
     assert h["BG"].max() > h0["BG"].max() + 5
+
+
+# --------------------------------------------------------------------------
+# Glucagon model switch: the original model stays available as 'legacy_linear'
+# --------------------------------------------------------------------------
+# The legacy row, written out so these tests keep checking the old model even after the
+# default row in glucagon_params.csv moves to a newer one.
+LEGACY_ROW = pd.Series({"Name": "default", "kgl_abs": 0.1, "kgl_cl": 0.12, "Vgl": 0.2,
+                        "kgl_eff": 0.1, "kgn": 1.1, "model": "legacy_linear"})
+REPO = Path(__file__).resolve().parents[2]
+BASELINE_CURVES = REPO / "baselines" / "glucagon_v0_linear" / "dose_curves.csv"
+
+
+def test_default_row_selects_legacy_linear():
+    assert load_glucagon_params()["model"] == "legacy_linear"
+    assert T1DPatient.withName("adult#001")._gmodel == "legacy_linear"
+
+
+def test_row_without_model_value_is_legacy_linear():
+    row = LEGACY_ROW.drop("model")
+    assert T1DPatient.withName("adult#001", glucagon_params=row)._gmodel == "legacy_linear"
+
+
+def test_unknown_glucagon_model_fails_early():
+    row = LEGACY_ROW.copy()
+    row["model"] = "no_such_model"
+    with pytest.raises(ValueError, match="unknown glucagon model"):
+        T1DPatient.withName("adult#001", glucagon_params=row)
+
+
+def test_explicit_legacy_row_gives_identical_response():
+    base = _fasting_run("adult#001", 0)
+    default = _fasting_run("adult#001", 300) - base
+
+    p = T1DPatient.withName("adult#001", glucagon_params=LEGACY_ROW)
+    basal = p._params.u2ss * p._params.BW / 6000
+    bg = []
+    for t in range(240):
+        p.step(Action(CHO=0, insulin=basal, glucagon=300 if t == 0 else 0))
+        bg.append(p.observation.Gsub)
+    np.testing.assert_allclose(np.array(bg) - base, default, atol=1e-9)
+
+
+@pytest.mark.skipif(not BASELINE_CURVES.exists(), reason="baselines/glucagon_v0_linear is not present")
+def test_legacy_linear_reproduces_committed_baseline(monkeypatch):
+    # Re-runs the exact protocol behind baselines/glucagon_v0_linear and compares curves.
+    # If this fails after a model change, the legacy branch changed behaviour.
+    monkeypatch.setattr(t1dpatient, "load_glucagon_params", lambda name=None: LEGACY_ROW.copy())
+    monkeypatch.syspath_prepend(str(REPO))
+    import report_graphs  # imports from the repo root; also sets a non-interactive matplotlib backend
+
+    new = report_graphs.run_hypo_protocol("adolescent#001", 200, 1.0, seed=1).sort_values("t_min")
+    old = pd.read_csv(BASELINE_CURVES)
+    old = old[(old.patient == "adolescent#001") & (old.dose_ug == 200)].sort_values("t_min")
+    assert len(new) == len(old)
+    for col in ("BG", "g0", "g1", "g2", "egp_gl"):
+        np.testing.assert_allclose(new[col].to_numpy(), old[col].to_numpy(), rtol=1e-6, atol=1e-6,
+                                   equal_nan=True, err_msg=col)
