@@ -164,7 +164,7 @@ def test_explicit_legacy_row_gives_identical_response():
 def test_legacy_linear_reproduces_committed_baseline(monkeypatch):
     # Re-runs the exact protocol behind baselines/glucagon_v0_linear and compares curves.
     # If this fails after a model change, the legacy branch changed behaviour.
-    monkeypatch.setattr(t1dpatient, "load_glucagon_params", lambda name=None: LEGACY_ROW.copy())
+    monkeypatch.setattr(t1dpatient, "load_glucagon_params", lambda name=None, model=None: LEGACY_ROW.copy())
     monkeypatch.syspath_prepend(str(REPO))
     import report_graphs  # imports from the repo root; also sets a non-interactive matplotlib backend
 
@@ -175,3 +175,72 @@ def test_legacy_linear_reproduces_committed_baseline(monkeypatch):
     for col in ("BG", "g0", "g1", "g2", "egp_gl"):
         np.testing.assert_allclose(new[col].to_numpy(), old[col].to_numpy(), rtol=1e-6, atol=1e-6,
                                    equal_nan=True, err_msg=col)
+
+
+# --------------------------------------------------------------------------
+# linear_wendt_pk: Wendt 2017 pharmacokinetics, same linear effect
+# --------------------------------------------------------------------------
+def _glucagon_run(p, rates):
+    """Step a fasting patient at basal insulin; rates[t] is glucagon in ug/min. Returns (BG, plasma pg/ml)."""
+    basal = p._params.u2ss * p._params.BW / 6000
+    bg, conc = [], []
+    for u in rates:
+        p.step(Action(CHO=0, insulin=basal, glucagon=u))
+        bg.append(p.observation.Gsub)
+        conc.append(p.plasma_glucagon_pg_ml)
+    return np.array(bg), np.array(conc)
+
+
+def test_params_are_selected_by_model():
+    legacy = load_glucagon_params()
+    wendt = load_glucagon_params(model="linear_wendt_pk")
+    assert legacy["model"] == "legacy_linear" and legacy["kgl_abs"] == 0.1
+    # means of Wendt 2017 Table 3 over the 8 patients
+    assert wendt["kgl_abs"] == pytest.approx(0.338 / 8)
+    assert wendt["kgl_cl"] == pytest.approx(1.368 / 8)
+    assert wendt["Cl_FC"] == pytest.approx(1025 / 8)
+    assert wendt["Cb"] == pytest.approx(85.0 / 8)
+    with pytest.raises(ValueError, match="unknown glucagon model"):
+        load_glucagon_params(model="no_such_model")
+
+
+def test_legacy_has_no_plasma_concentration():
+    assert np.isnan(T1DPatient.withName("adult#001").plasma_glucagon_pg_ml)
+
+
+def test_wendt_pk_basal_and_steady_state_concentration():
+    p = T1DPatient.withName("adult#001", glucagon_model="linear_wendt_pk")
+    g = load_glucagon_params(model="linear_wendt_pk")
+    assert p.plasma_glucagon_pg_ml == pytest.approx(g["Cb"])
+    # constant infusion u: at steady state, C - Cb = u / (BW * clearance), here in pg/ml
+    u = 1.0  # ug/min
+    _, conc = _glucagon_run(p, [u] * 600)
+    assert conc[-1] - g["Cb"] == pytest.approx(1e6 * u / (p._params.BW * g["Cl_FC"]), rel=1e-6)
+
+
+def test_wendt_pk_plasma_peak_time_matches_clinical_range():
+    p = T1DPatient.withName("adult#001", glucagon_model="linear_wendt_pk")
+    _, conc = _glucagon_run(p, [200.0] + [0.0] * 119)  # 200 ug in the first minute
+    t_peak = np.argmax(conc) + 1  # conc[i] is at the end of minute i+1
+    assert 7.5 <= t_peak <= 19.1  # range of Wendt 2017 Table 3
+
+
+def test_wendt_pk_zero_glucagon_matches_original_model():
+    name = "adolescent#001"
+    p = T1DPatient.withName(name, glucagon_model="linear_wendt_pk")
+    basal = p._params.u2ss * p._params.BW / 6000
+    got = {}
+    for t in range(720):
+        meal = 20 if t in (400, 401, 402, 403) else 0
+        p.step(Action(CHO=meal, insulin=basal + (5 if t == 400 else 0)))
+        if t in (500, 719):
+            got[t] = p.observation.Gsub
+    assert got[500] == pytest.approx(ORIGINAL_REFERENCE[name][0], abs=1e-4)
+    assert got[719] == pytest.approx(ORIGINAL_REFERENCE[name][1], abs=1e-4)
+
+
+def test_wendt_pk_glucagon_still_raises_bg():
+    rates = [200.0] + [0.0] * 239
+    base, _ = _glucagon_run(T1DPatient.withName("adult#001", glucagon_model="linear_wendt_pk"), [0.0] * 240)
+    dosed, _ = _glucagon_run(T1DPatient.withName("adult#001", glucagon_model="linear_wendt_pk"), rates)
+    assert (dosed - base).max() > 1.0

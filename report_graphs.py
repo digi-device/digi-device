@@ -319,7 +319,8 @@ def _git(*args):
 
 def write_manifest(out, args, patients, doses, skipped):
     try:
-        gparams = {k: (float(v) if not isinstance(v, str) else v) for k, v in load_glucagon_params().to_dict().items()}
+        gparams = {k: (v if isinstance(v, str) else float(v)) for k, v in load_glucagon_params().to_dict().items()
+                   if isinstance(v, str) or not np.isnan(float(v))}  # blank cells (NaN) are not valid JSON
     except Exception:
         gparams = None
     manifest = {

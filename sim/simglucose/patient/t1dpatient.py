@@ -24,20 +24,33 @@ N_BASE_STATES = 13  # original UVA/Padova states (solved by the ODE solver)
 N_STATES = 16  # + 3 glucagon states (x13, x14, x15), solved exactly, see below
 
 
-def load_glucagon_params(name=None):
-    """Glucagon parameters for a patient; falls back to the 'default' row."""
+# Glucagon-action models, selected by the 'model' column of glucagon_params.csv.
+#   legacy_linear:   glucagon effect is added to EGP in proportion to the delayed plasma
+#                    glucagon (kgn * g2). Kept unchanged so earlier results stay reproducible.
+#   linear_wendt_pk: same linear effect, but the pharmacokinetics use the fitted constants of
+#                    Wendt et al. 2017 (Table 3 means): kgl_abs = k1, kgl_cl = k2, plasma
+#                    clearance Cl_FC (ml/kg/min) and basal level Cb (pg/ml). The effect chain is
+#                    driven by plasma glucagon above basal instead of g1/Vgl. Vgl is unused.
+GLUCAGON_MODELS = ("legacy_linear", "linear_wendt_pk")
+DEFAULT_GLUCAGON_MODEL = "legacy_linear"
+
+
+def load_glucagon_params(name=None, model=None):
+    """Glucagon parameters for a patient and model; falls back to the model's 'default' row.
+
+    model=None selects DEFAULT_GLUCAGON_MODEL.
+    """
+    model = DEFAULT_GLUCAGON_MODEL if model is None else model
+    if model not in GLUCAGON_MODELS:
+        raise ValueError(f"unknown glucagon model '{model}'; choose one of {GLUCAGON_MODELS}")
     table = pd.read_csv(GLUCAGON_PARA_FILE)
+    table = table.loc[table.model.fillna(DEFAULT_GLUCAGON_MODEL) == model]
     row = table.loc[table.Name == name]
     if row.empty:
         row = table.loc[table.Name == "default"]
+    if row.empty:
+        raise ValueError(f"no glucagon parameters for model '{model}' in {GLUCAGON_PARA_FILE}")
     return row.squeeze()
-
-
-# Glucagon-action models, selected by the 'model' column of glucagon_params.csv.
-#   legacy_linear: glucagon effect is added to EGP in proportion to the delayed plasma
-#                  glucagon (kgn * g2). Kept unchanged so earlier results stay reproducible.
-GLUCAGON_MODELS = ("legacy_linear",)
-DEFAULT_GLUCAGON_MODEL = "legacy_linear"
 
 
 def glucagon_model_name(gparams):
@@ -60,9 +73,30 @@ def glucagon_egp(gparams, glu_effect):
     if gparams is None:
         return 0.0
     model = glucagon_model_name(gparams)
-    if model == "legacy_linear":
+    if model in ("legacy_linear", "linear_wendt_pk"):
         return gparams.kgn * glu_effect
     raise NotImplementedError(model)  # listed in GLUCAGON_MODELS but not implemented above
+
+
+def glucagon_effect_coupling(gparams):
+    """Gain from the plasma state g1 (ug/kg) to the input of the delayed-effect state g2 (ug/L).
+
+    legacy_linear divides by a volume (Vgl). linear_wendt_pk uses the apparent clearance: plasma
+    glucagon above basal is kgl_cl * g1 / Cl_FC (ug/ml), times 1000 for ug/L.
+    """
+    if glucagon_model_name(gparams) == "linear_wendt_pk":
+        return gparams.kgl_eff * 1000.0 * gparams.kgl_cl / gparams.Cl_FC
+    return gparams.kgl_eff / gparams.Vgl
+
+
+def glucagon_plasma_pg_ml(gparams, g1):
+    """Plasma glucagon in pg/ml for a plasma state g1 (ug/kg): Cb + 1e6 * kgl_cl * g1 / Cl_FC.
+
+    Same as Wendt et al. C = k2*Z2/(W*Cl_FC) + Cb. NaN for legacy_linear, which has no clearance or basal level.
+    """
+    if glucagon_model_name(gparams) == "legacy_linear":
+        return float("nan")
+    return float(gparams.Cb + 1e6 * gparams.kgl_cl * g1 / gparams.Cl_FC)
 
 
 class T1DPatient(Patient):
@@ -77,6 +111,7 @@ class T1DPatient(Patient):
         seed=None,
         t0=0,
         glucagon_params=None,
+        glucagon_model=None,
     ):
         """
         T1DPatient constructor.
@@ -88,10 +123,12 @@ class T1DPatient(Patient):
             - t0: simulation start time, it is 0 by default
             - glucagon_params: pandas sequence from glucagon_params.csv. If
               not given, the 'default' row (or this patient's row) is used.
+            - glucagon_model: which glucagon model's rows to use (see
+              GLUCAGON_MODELS). Ignored if glucagon_params is given.
         """
         self._params = params
         if glucagon_params is None:
-            glucagon_params = load_glucagon_params(params.Name)
+            glucagon_params = load_glucagon_params(params.Name, glucagon_model)
         self._gparams = glucagon_params
         self._gmodel = glucagon_model_name(glucagon_params)  # fails early on an unknown model
         self._init_state = init_state
@@ -138,6 +175,11 @@ class T1DPatient(Patient):
     @property
     def sample_time(self):
         return self.SAMPLE_TIME
+
+    @property
+    def plasma_glucagon_pg_ml(self):
+        """Plasma glucagon (pg/ml), or NaN for models without a clearance (legacy_linear)."""
+        return glucagon_plasma_pg_ml(self._gparams, self._gstate[1])
 
     def step(self, action):
         # Convert announcing meal to the meal amount to eat at the moment
@@ -310,7 +352,8 @@ class T1DPatient(Patient):
         infusion rate in ug/kg/min, held constant over the step.
             dg0 = u - kgl_abs*g0
             dg1 = kgl_abs*g0 - kgl_cl*g1
-            dg2 = -kgl_eff*(g2 - g1/Vgl)
+            dg2 = -kgl_eff*(g2 - g1/Vgl)          (legacy_linear)
+            dg2 = -kgl_eff*(g2 - 1000*kgl_cl*g1/Cl_FC)   (linear_wendt_pk: plasma glucagon above basal)
         This follows the same depot -> plasma -> delayed-action chain as insulin.
         """
         gp = self._gparams
@@ -318,7 +361,7 @@ class T1DPatient(Patient):
             [
                 [-gp.kgl_abs, 0.0, 0.0],
                 [gp.kgl_abs, -gp.kgl_cl, 0.0],
-                [0.0, gp.kgl_eff / gp.Vgl, -gp.kgl_eff],
+                [0.0, glucagon_effect_coupling(gp), -gp.kgl_eff],
             ]
         )
         B = np.array([1.0, 0.0, 0.0])

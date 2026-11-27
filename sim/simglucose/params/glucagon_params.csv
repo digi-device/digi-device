@@ -1,2 +1,3 @@
-Name,kgl_abs,kgl_cl,Vgl,kgl_eff,kgn,model
-default,0.1,0.12,0.2,0.1,1.1,legacy_linear
+Name,kgl_abs,kgl_cl,Vgl,kgl_eff,kgn,model,Cl_FC,Cb
+default,0.1,0.12,0.2,0.1,1.1,legacy_linear,,
+default,0.04225,0.171,0.2,0.1,1.1,linear_wendt_pk,128.125,10.625
