@@ -1,0 +1,35 @@
+{% extends 'base.html' %}
+{% block content %}
+<h2>Dual-hormone simulation</h2>
+<p>Virtual-patient research only. Run the existing simulated controller with full, partial or missing meal announcements. Saved research profiles are not applied to hormone delivery.</p>
+<section>
+  <h3>New experiment</h3>
+  {% if error %}<p role="alert" class="error">{{ error }}</p>{% endif %}
+  <form action="{{ url_for('portal.launch_simulation') }}" method="post" onsubmit="this.querySelector('button').disabled=true;this.querySelector('button').textContent='Running simulation…';">
+    <input type="hidden" name="csrf" value="{{ session.csrf }}">
+    <label>Virtual patient <select name="patient">{% for p in patients %}<option>{{ p }}</option>{% endfor %}</select></label>
+    <label>Duration <select name="hours"><option>12</option><option selected>24</option><option>48</option></select> hours</label>
+    <label>Random seed <input type="number" name="seed" min="0" max="2147483647" value="1" required></label>
+    <label>Carbohydrate reporting <select name="reporting"><option value="fixed">Fixed factor</option><option value="random">Random factor per meal (0–1)</option></select></label>
+    <label>Fixed reporting factor (ignored in random mode) <input type="number" name="factor" min="0" max="1" step="any" value="1" required></label>
+    <p>1 = full meal reported; 0.5 = half reported; 0 = forgotten meal. The actual virtual meal remains unchanged.</p>
+    <button type="submit">Run Mode 2</button>
+  </form>
+</section>
+<h3>My simulation history</h3>
+{% for r in runs %}
+<section id="run-{{ r.id }}">
+  <h4>{{ r.label }}</h4><p>{{ r.recorded_at }} UTC</p>
+  {% if r.graph_id %}
+  {% set s = r.summary %}
+  <p>Seed {{ s.seed }} · {% if s.randomized %}Random reporting{% else %}Fixed factor {{ s.factor }}{% endif %} · {{ '%.2f'|format(s.simulated_hours) }} hours simulated</p>
+  <div class="metrics">
+    {% for label, key, unit in [('Mean glucose','mean','mg/dL'),('Time in range','TIR','%'),('Below range','TBR','%'),('Above range','TAR','%'),('Actual carbs','actual_carbs','g'),('Reported carbs','reported_carbs','g'),('Unreported carbs','unreported_carbs','g'),('Glucagon delivered','glucagon_ug','µg')] %}
+    <div><small>{{ label }}</small><strong>{{ '%.1f'|format(s[key]) }} {{ unit }}</strong></div>
+    {% endfor %}
+  </div>
+  <img class="simulation-graph" src="{{ url_for('portal.simulation_graph',run_id=r.id) }}" alt="Simulated glucose, insulin, glucagon and actual versus reported carbohydrate history" loading="lazy">
+  {% else %}<pre>{{ r.summary|tojson(indent=2) }}</pre>{% endif %}
+</section>
+{% else %}<p>No simulations saved yet.</p>{% endfor %}
+{% endblock %}

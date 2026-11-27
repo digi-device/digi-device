@@ -14,6 +14,7 @@ Outputs go to results/ (git-ignored): <patient>.png and <patient>.csv
 import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
+from carb_reporting import CarbReporting
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -174,6 +175,14 @@ def plot_dual(df, patient_name, stats, rescues):
             ax_bg.axvline(t[i], color="tab:red", lw=1, ls=":")
 
     _plot_meals(ax_cho, ax_bg, t, dt, carbs_g)
+    if "CHO_reported" in df:
+        reported_g = df["CHO_reported"].iloc[:-1].fillna(0).values * dt
+        ax_cho.step(t, reported_g, where="post", color="tab:blue", lw=1.5,
+                    label="Reported carbs")
+        from matplotlib.patches import Patch
+        handles, labels = ax_cho.get_legend_handles_labels()
+        ax_cho.legend([Patch(color="tab:orange", label="Actual carbs"), *handles],
+                      ["Actual carbs", *labels], loc="upper right", fontsize=8)
 
     fig.autofmt_xdate()
     fig.tight_layout()
@@ -225,27 +234,38 @@ def build_dual_env(patient_name, meals, seed, gl_config, glucagon_model=None):
     return DualHormoneEnv(patient, sensor, insulin_pump, glucagon_pump, scenario), start
 
 
-def run_dual(patient_name, hours, meals, seed, gl_config, controller, glucagon_model=None):
+def run_dual(patient_name, hours, meals, seed, gl_config, controller, *, glucagon_model=None, reporting=None):
     """Run the two-pump closed loop; returns history (df)"""
     env, start = build_dual_env(patient_name, meals, seed, gl_config, glucagon_model)
     controller.reset()
+    reporting = reporting or CarbReporting()
     obs, reward, done, info = env.reset()
+    reported_meal = 0.0
     while env.time < start + timedelta(hours=hours):
-        action = controller.policy(obs, reward, done, **info)
+        # Keep the original scenario and physiological meal input unchanged.
+        # Only the synthetic meal announcement in the controller input differs.
+        controller_info = dict(info, meal=reported_meal)
+        action = controller.policy(obs, reward, done, **controller_info)
         obs, reward, done, info = env.step(action)
+        reported_meal = reporting.report(info["meal"])
         if done:
             print("Stopped early: glucose left the safe simulation range.")
             break
-    return env.show_history()
+    df = env.show_history()
+    # CHO is recorded at the action row, not the next observation row.
+    df["CHO_reported"] = [x[0] for x in reporting.history] + [float("nan")]
+    df["carb_reporting_factor"] = [x[1] for x in reporting.history] + [float("nan")]
+    return df
 
 
 # --------------------------------------------------------------------------
 # Entry points
 # --------------------------------------------------------------------------
 def _save_and_report(df, fig, stem, stats, args):
-    RESULTS_DIR.mkdir(exist_ok=True)
-    df.to_csv(RESULTS_DIR / f"{stem}.csv")
-    png = RESULTS_DIR / f"{stem}.png"
+    output = Path(args.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    df.to_csv(output / f"{stem}.csv")
+    png = output / f"{stem}.png"
     fig.savefig(png, dpi=150)
     print(f"Saved {png}")
     print({k: round(float(v), 1) for k, v in stats.items()})
@@ -282,7 +302,9 @@ def dual_run_and_plot(args):
         dose_ug=args.rescue_dose,
     )
 
-    df = run_dual(args.patient, args.hours, meals, args.seed, gl_config, controller, args.glucagon_model)
+    reporting = CarbReporting(args.carb_factor, args.random_carb_reporting, args.seed)
+    df = run_dual(args.patient, args.hours, meals, args.seed, gl_config, controller,
+                  glucagon_model=args.glucagon_model, reporting=reporting)
     stats = summarize(df)
     stats["glucagon_ug"] = df["glucagon"].sum() * (df.index[1] - df.index[0]).total_seconds() / 60
     stats["rescues"] = controller.rescues
@@ -300,12 +322,17 @@ def main():
     ap.add_argument("--patient", default="adolescent#001")
     ap.add_argument("--hours", type=float, default=24)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--output-dir", type=Path, default=RESULTS_DIR)
     ap.add_argument("--show", action="store_true",
                     help="open the figure at the end (default: only save it)")
 
     g = ap.add_argument_group("mode 2 (glucagon)")
-    g.add_argument("--bolus-mult", type=float, default=2.0,
-                   help="scale meal boluses; >1 over-delivers insulin to cause lows (default 2)")
+    g.add_argument("--carb-factor", type=float, default=1.0,
+                   help="fraction of actual meal reported to simulated controller")
+    g.add_argument("--random-carb-reporting", action="store_true",
+                   help="draw a reproducible uniform reporting factor for each meal")
+    g.add_argument("--bolus-mult", type=float, default=1.0,
+                   help="scale meal boluses; >1 over-delivers insulin to cause lows (default 1)")
     g.add_argument("--rescue-threshold", type=float, default=75.0,
                    help="CGM below this triggers glucagon, mg/dL")
     g.add_argument("--rescue-dose", type=float, default=150.0, help="glucagon per rescue, ug")
@@ -320,6 +347,10 @@ def main():
     g.add_argument("--glucagon-model", choices=GLUCAGON_MODELS, default=None,
                    help="glucagon action model (default: the library default, legacy_linear)")
     args = ap.parse_args()
+    if args.mode == 1 and (args.carb_factor != 1 or args.random_carb_reporting):
+        ap.error("Carbohydrate reporting options require mode 2")
+    if not 0 <= args.carb_factor <= 1:
+        ap.error("--carb-factor must be between 0 and 1")
 
     if not args.show:
         matplotlib.use("Agg")  # no window, no animation

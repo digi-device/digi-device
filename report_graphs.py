@@ -251,7 +251,7 @@ def _stress_job(args):
     meals = [(float(h), g) for h, g in DEFAULT_MEALS]
     threshold = 75.0 if arm == "glucagon" else -1.0  # -1 never fires: insulin-only reference
     ctrl = RescueController(bolus_mult=mult, threshold=threshold, dose_ug=150.0)
-    df = run_dual(name, STRESS_HOURS, meals, seed, PumpConfig(max_flow=100.0, seed=seed), ctrl, model)
+    df = run_dual(name, STRESS_HOURS, meals, seed, PumpConfig(max_flow=100.0, seed=seed), ctrl, glucagon_model=model)
     st = summarize(df)
     dt = (df.index[1] - df.index[0]).total_seconds() / 60
     return {
@@ -384,7 +384,7 @@ def run_experiments(args):
         print("[5/5] rescue trace")
         ctrl = RescueController(bolus_mult=2.0, threshold=75.0, dose_ug=150.0)
         meals = [(float(h), g) for h, g in DEFAULT_MEALS]
-        df = run_dual(patients[0], STRESS_HOURS, meals, seed, PumpConfig(max_flow=100.0, seed=seed), ctrl, model)
+        df = run_dual(patients[0], STRESS_HOURS, meals, seed, PumpConfig(max_flow=100.0, seed=seed), ctrl, glucagon_model=model)
         df["patient"] = patients[0]
         df.to_csv(out / "rescue_trace.csv")
 

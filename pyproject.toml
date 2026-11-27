@@ -16,9 +16,15 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4"]
+portal = ["flask>=3.1,<4"]
 kaggle = ["kagglehub[pandas-datasets]"]
 
 # No top-level Python package yet; stops setuptools auto-discovery from
 # picking up sim/ and results/
 [tool.setuptools]
-packages = []
+packages = ["users", "database", "personalization", "interface"]
+py-modules = ["main", "config", "simulation_import", "carb_reporting", "run_sim"]
+
+[tool.setuptools.package-data]
+database = ["schema.sql"]
+interface = ["templates/*.html", "static/*.css"]
