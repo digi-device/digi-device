@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 
 from simglucose.actuator.pump import InsulinPump, PumpConfig, PumpModel
 from simglucose.controller.basal_bolus_ctrller import BBController
-from simglucose.patient.t1dpatient import T1DPatient
+from simglucose.patient.t1dpatient import GLUCAGON_MODELS, T1DPatient
 from simglucose.sensor.cgm import CGMSensor
 from simglucose.simulation.dual_env import DualAction, DualHormoneEnv
 from simglucose.simulation.env import T1DSimEnv
@@ -215,9 +215,9 @@ class RescueController:
         return DualAction(a.basal, a.bolus * self.bolus_mult, glucagon)
 
 
-def build_dual_env(patient_name, meals, seed, gl_config):
+def build_dual_env(patient_name, meals, seed, gl_config, glucagon_model=None):
     start = datetime(2024, 1, 1, 0, 0)
-    patient = T1DPatient.withName(patient_name)
+    patient = T1DPatient.withName(patient_name, glucagon_model=glucagon_model)  # None = library default
     sensor = CGMSensor.withName("Dexcom", seed=seed)
     insulin_pump = InsulinPump.withName("Insulet")
     glucagon_pump = PumpModel(gl_config)
@@ -225,9 +225,9 @@ def build_dual_env(patient_name, meals, seed, gl_config):
     return DualHormoneEnv(patient, sensor, insulin_pump, glucagon_pump, scenario), start
 
 
-def run_dual(patient_name, hours, meals, seed, gl_config, controller):
+def run_dual(patient_name, hours, meals, seed, gl_config, controller, glucagon_model=None):
     """Run the two-pump closed loop; returns history (df)"""
-    env, start = build_dual_env(patient_name, meals, seed, gl_config)
+    env, start = build_dual_env(patient_name, meals, seed, gl_config, glucagon_model)
     controller.reset()
     obs, reward, done, info = env.reset()
     while env.time < start + timedelta(hours=hours):
@@ -282,7 +282,7 @@ def dual_run_and_plot(args):
         dose_ug=args.rescue_dose,
     )
 
-    df = run_dual(args.patient, args.hours, meals, args.seed, gl_config, controller)
+    df = run_dual(args.patient, args.hours, meals, args.seed, gl_config, controller, args.glucagon_model)
     stats = summarize(df)
     stats["glucagon_ug"] = df["glucagon"].sum() * (df.index[1] - df.index[0]).total_seconds() / 60
     stats["rescues"] = controller.rescues
@@ -317,6 +317,8 @@ def main():
                    help="glucagon pump flow noise, fraction (0.05 = 5%%)")
     g.add_argument("--gl-reservoir", type=float, default=float("inf"),
                    help="glucagon reservoir size, ug")
+    g.add_argument("--glucagon-model", choices=GLUCAGON_MODELS, default=None,
+                   help="glucagon action model (default: the library default, legacy_linear)")
     args = ap.parse_args()
 
     if not args.show:

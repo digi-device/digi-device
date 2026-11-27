@@ -4,6 +4,7 @@ Two steps, so a run made BEFORE a model change stays on disk and can be overlaid
 
     python report_graphs.py run --tag glucagon_v0_linear          # simulate, save data, draw figures
     python report_graphs.py run --tag glucagon_v0_linear --quick  # 2 patients, fewer doses (smoke test)
+    python report_graphs.py run --tag pk_check --glucagon-model linear_wendt_pk
     python report_graphs.py plot --tag glucagon_v0_linear         # redraw from saved CSVs only
     python report_graphs.py compare --tags glucagon_v0_linear glucagon_v1_saturating
 
@@ -49,8 +50,11 @@ from run_sim import DEFAULT_MEALS, RescueController, run_dual, summarize  # noqa
 from simglucose.actuator.pump import InsulinPump, PumpConfig, PumpModel  # noqa: E402
 from simglucose.controller.basal_bolus_ctrller import CONTROL_QUEST, BBController  # noqa: E402
 from simglucose.patient.t1dpatient import (  # noqa: E402
+    DEFAULT_GLUCAGON_MODEL,
+    GLUCAGON_MODELS,
     PATIENT_PARA_FILE,
     T1DPatient,
+    glucagon_egp,
     load_glucagon_params,
 )
 from simglucose.sensor.cgm import CGMSensor  # noqa: E402
@@ -143,27 +147,26 @@ def _tight(fig, top=1.0):
 def snapshot(env):
     """Read internal states for plotting. The ONLY place that touches private patient attributes.
 
-    Legacy model: 3 glucagon states (depot g0, plasma g1, delayed effect g2) in patient.state[13:16].
-    plasma_glucagon_pg_ml is NaN until the planned PK change provides it (GLUCAGON_PLAN.md step 2).
+    3 glucagon states (depot g0, plasma g1, delayed effect g2) in patient.state[13:16].
+    plasma_glucagon_pg_ml is NaN for legacy_linear, which has no clearance to convert g1 into a concentration.
     """
     p = env.patient
     x = p.state
     prm = p._params
     gp = getattr(p, "_gparams", None)
     g0, g1, g2 = float(x[13]), float(x[14]), float(x[15])
-    kgn = float(gp["kgn"]) if gp is not None and "kgn" in gp else float("nan")
-    egp_gl = kgn * g2
+    egp_gl = float(glucagon_egp(gp, g2))  # same function the patient model uses
     egp = float(prm.kp1 - prm.kp2 * x[3] - prm.kp3 * x[8]) + egp_gl
     return {
         "g0": g0, "g1": g1, "g2": g2,
         "egp": max(egp, 0.0), "egp_gl": egp_gl,
         "insulin_mU_l": float(x[5] / prm.Vi / 6.0),  # pmol/l -> mU/l (1 U = 6000 pmol)
-        "plasma_glucagon_pg_ml": float("nan"),
+        "plasma_glucagon_pg_ml": p.plasma_glucagon_pg_ml,
     }
 
 
-def _build_env(name, seed):
-    patient = T1DPatient.withName(name)
+def _build_env(name, seed, glucagon_model=None):
+    patient = T1DPatient.withName(name, glucagon_model=glucagon_model)
     sensor = CGMSensor.withName("Dexcom", seed=seed)
     insulin_pump = InsulinPump.withName("Insulet")
     glucagon_pump = PumpModel(PumpConfig(seed=seed))  # ideal pump: no clipping up to 500 ug
@@ -177,9 +180,9 @@ def _correction_factor(name):
     return float(row.CF.iloc[0]) if len(row) else 50.0  # mg/dl per U
 
 
-def run_hypo_protocol(name, dose_ug, bolus_mult=1.0, seed=1, post_min=POST_MIN):
+def run_hypo_protocol(name, dose_ug, bolus_mult=1.0, seed=1, post_min=POST_MIN, glucagon_model=None):
     """Correction bolus, wait for BG <= TRIGGER, dose at t=0, follow post_min. Returns a DataFrame or None."""
-    env = _build_env(name, seed)
+    env = _build_env(name, seed, glucagon_model)
     bb = BBController()
     obs, reward, done, info = env.reset()
     snaps = [snapshot(env)]
@@ -235,20 +238,20 @@ def run_hypo_protocol(name, dose_ug, bolus_mult=1.0, seed=1, post_min=POST_MIN):
 
 
 def _curve_job(args):
-    name, dose, mult, seed = args
+    name, dose, mult, seed, model = args
     try:
-        return run_hypo_protocol(name, dose, mult, seed)
+        return run_hypo_protocol(name, dose, mult, seed, glucagon_model=model)
     except Exception as exc:  # keep one bad patient from killing the whole run
         print(f"  ! {name} dose={dose} mult={mult}: {exc}")
         return None
 
 
 def _stress_job(args):
-    name, mult, arm, seed = args
+    name, mult, arm, seed, model = args
     meals = [(float(h), g) for h, g in DEFAULT_MEALS]
     threshold = 75.0 if arm == "glucagon" else -1.0  # -1 never fires: insulin-only reference
     ctrl = RescueController(bolus_mult=mult, threshold=threshold, dose_ug=150.0)
-    df = run_dual(name, STRESS_HOURS, meals, seed, PumpConfig(max_flow=100.0, seed=seed), ctrl)
+    df = run_dual(name, STRESS_HOURS, meals, seed, PumpConfig(max_flow=100.0, seed=seed), ctrl, model)
     st = summarize(df)
     dt = (df.index[1] - df.index[0]).total_seconds() / 60
     return {
@@ -319,7 +322,8 @@ def _git(*args):
 
 def write_manifest(out, args, patients, doses, skipped):
     try:
-        gparams = {k: (v if isinstance(v, str) else float(v)) for k, v in load_glucagon_params().to_dict().items()
+        row = load_glucagon_params(model=args.glucagon_model).to_dict()
+        gparams = {k: (v if isinstance(v, str) else float(v)) for k, v in row.items()
                    if isinstance(v, str) or not np.isnan(float(v))}  # blank cells (NaN) are not valid JSON
     except Exception:
         gparams = None
@@ -330,6 +334,7 @@ def write_manifest(out, args, patients, doses, skipped):
         "git_dirty": bool(_git("status", "--porcelain")),
         "command": " ".join(sys.argv),
         "seed": args.seed, "quick": args.quick,
+        "glucagon_model": args.glucagon_model,
         "patients": patients, "doses_ug": doses, "bolus_mults": MULTS, "gate_dose_ug": GATE_DOSE,
         "trigger_mg_dl": TRIGGER, "target_nadir_mg_dl": TARGET_NADIR, "sample_min": SAMPLE,
         "stress_hours": STRESS_HOURS, "skipped_patients": skipped,
@@ -353,7 +358,9 @@ def run_experiments(args):
     seed, jobs = args.seed, args.jobs
 
     print(f"[1/5] dose curves: {len(patients)} patients x {len(doses)} doses")
-    items = [(p, d, 1.0, seed) for p in patients for d in doses]
+    model = args.glucagon_model
+    print(f"glucagon model: {model}")
+    items = [(p, d, 1.0, seed, model) for p in patients for d in doses]
     res = _map(_curve_job, items, jobs)
     skipped = sorted({it[0] for it, r in zip(items, res) if r is None})
     if skipped:
@@ -361,23 +368,23 @@ def run_experiments(args):
     _concat(res, "dose curves").to_csv(out / "dose_curves.csv", index=False)
 
     print(f"[2/5] insulin dependence: {len(patients)} patients x {len(MULTS)} bolus multipliers x 2")
-    items = [(p, d, m, seed) for p in patients for m in MULTS for d in (0, GATE_DOSE)]
+    items = [(p, d, m, seed, model) for p in patients for m in MULTS for d in (0, GATE_DOSE)]
     _concat(_map(_curve_job, items, jobs), "insulin dependence").to_csv(out / "insulin_dependence.csv", index=False)
 
     print(f"[3/5] population: {len(pop_patients)} patients, doses 0 and {GATE_DOSE}")
-    items = [(p, d, 1.0, seed) for p in pop_patients for d in (0, GATE_DOSE)]
+    items = [(p, d, 1.0, seed, model) for p in pop_patients for d in (0, GATE_DOSE)]
     pop = _concat(_map(_curve_job, items, jobs), "population")
     pop[["patient", "dose_ug", "t_min", "BG"]].to_csv(out / "population.csv", index=False)
 
     if not args.skip_stress:
         print(f"[4/5] closed-loop stress test: {len(patients)} patients x {len(MULTS)} multipliers x 2 arms, {STRESS_HOURS} h")
-        items = [(p, m, a, seed) for p in patients for m in MULTS for a in ("insulin_only", "glucagon")]
+        items = [(p, m, a, seed, model) for p in patients for m in MULTS for a in ("insulin_only", "glucagon")]
         pd.DataFrame(_map(_stress_job, items, jobs)).to_csv(out / "stress.csv", index=False)
 
         print("[5/5] rescue trace")
         ctrl = RescueController(bolus_mult=2.0, threshold=75.0, dose_ug=150.0)
         meals = [(float(h), g) for h, g in DEFAULT_MEALS]
-        df = run_dual(patients[0], STRESS_HOURS, meals, seed, PumpConfig(max_flow=100.0, seed=seed), ctrl)
+        df = run_dual(patients[0], STRESS_HOURS, meals, seed, PumpConfig(max_flow=100.0, seed=seed), ctrl, model)
         df["patient"] = patients[0]
         df.to_csv(out / "rescue_trace.csv")
 
@@ -495,24 +502,31 @@ def fig_cascade(curves, out, suffix="", dose=GATE_DOSE):
     a.set_ylabel("EGP\n(mg/kg/min)")
     a.legend(loc="upper right")
 
-    a = next(ax)  # glucose
-    a.plot(t, g.BG, color=BLUE)
+    a = next(ax)  # glucose, with the matched no-glucagon run so the drug effect can be seen
+    a.plot(t, g.BG, color=BLUE, label=f"{dose} µg")
+    ctrl = curves[(curves.patient == patient) & (curves.dose_ug == 0)].set_index("t_min")["BG"]
+    if not ctrl.empty:
+        a.plot(ctrl.index, ctrl.values, color=MUTED, lw=1.2, ls="--", label="No glucagon")
+        a.legend(loc="upper left")
     a.axhline(70, color=CRIT, lw=0.8)
     a.set_ylabel("Blood glucose\n(mg/dl)")
     a.set_xlabel("Minutes after glucagon dose")
     a.set_xlim(0, 240)
 
     t_pl = t[int(np.nanargmax(g.g1.to_numpy(float)))]
-    t_bg = t[int(np.nanargmax(g.BG.to_numpy(float)))]
+    # time of the largest glucagon EFFECT (dose minus control); the raw maximum can be the late insulin recovery
+    effect = g.set_index("t_min")["BG"] - ctrl if not ctrl.empty else g.set_index("t_min")["BG"]
+    t_bg = float(effect.idxmax())
     for axx in axes:
         for x in (t_pl, t_bg):
             axx.axvline(x, color=MUTED, lw=0.8, ls=":")
     axes[0].text(t_pl, 1.03, f"plasma peak {t_pl:.0f} min", transform=axes[0].get_xaxis_transform(),
                  ha="center", va="bottom", fontsize=8, color=INK2)
-    axes[0].text(t_bg, 1.03, f"glucose peak {t_bg:.0f} min", transform=axes[0].get_xaxis_transform(),
+    axes[0].text(t_bg, 1.03, f"peak glucose effect {t_bg:.0f} min", transform=axes[0].get_xaxis_transform(),
                  ha="center", va="bottom", fontsize=8, color=INK2)
     fig.suptitle(f"Lag chain for a {dose} µg dose ({patient})", x=0.01, ha="left", fontsize=10, fontweight="bold")
-    _note(fig, "Legacy model: plasma glucagon is in µg/kg (no pg/ml until the PK change). EGP is approximate, from end-of-step states.")
+    conc_note = "" if has_conc else "This model has no plasma concentration in pg/ml, so glucagon is shown in µg/kg. "
+    _note(fig, conc_note + "EGP is approximate, from end-of-step states.")
     _tight(fig, 0.97)
     _save(fig, out, f"02_pk_pd_cascade{suffix}.png")
 
@@ -702,7 +716,7 @@ def fig_population(data, tags, out):
     ax.set_xlabel("Minutes after glucagon dose")
     ax.set_ylabel("Blood glucose (mg/dl)")
     ax.set_title(f"Spread of the {GATE_DOSE} µg response across virtual patients", loc="left")
-    _note(fig, f"n = {n} virtual patients. In the legacy model all patients share one glucagon parameter row, "
+    _note(fig, f"n = {n} virtual patients. All patients currently share one glucagon parameter row, "
                "so spread comes from body weight and glucose-insulin parameters only.")
     _tight(fig)
     _save(fig, out, "07_population_fan.png")
@@ -772,6 +786,8 @@ def main():
     r.add_argument("--patients", help="comma-separated names (default: 6-patient panel)")
     r.add_argument("--quick", action="store_true", help="2 patients, fewer doses: smoke test")
     r.add_argument("--seed", type=int, default=1)
+    r.add_argument("--glucagon-model", choices=GLUCAGON_MODELS, default=DEFAULT_GLUCAGON_MODEL,
+                   help=f"which glucagon model to simulate (default {DEFAULT_GLUCAGON_MODEL})")
     r.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 1), help="parallel processes")
     r.add_argument("--skip-stress", action="store_true", help="skip the 24 h closed-loop runs (slowest part)")
 
